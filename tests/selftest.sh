@@ -14,6 +14,7 @@ PGDATA=${PGDATA:-/tmp/selftest-pgdata}
 PGPORT=55433
 PGSOCK=/tmp/selftest-pgsock
 SQLDIR=/tmp/selftest-sqlite
+SQLDIR2=/tmp/selftest-sqlite-legacy
 APPPORT=8011
 BASE="http://127.0.0.1:$APPPORT"
 SHA64="a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
@@ -41,6 +42,7 @@ start_app(){ # start_app <sqlite_dir> [init_sleep_ms]
   done
   mkdir -p "$dir"
   PG_DSN="$DSN" SQLITE_PATH="$dir/history.db" CAPTURE_INIT_SLEEP_MS="$sleep_ms" \
+    TEST_SKIP_FEEDBACK="${TEST_SKIP_FEEDBACK:-0}" \
     setsid nohup python3 -m uvicorn app.main:app --host 127.0.0.1 \
     --port "$APPPORT" > /tmp/selftest-app.log 2>&1 < /dev/null &
   local new_pid=$!
@@ -88,7 +90,7 @@ trap cleanup EXIT
 # ------------------------------------------------------------- 0. 准备源库
 echo "=== 0. 准备全新源 PostgreSQL（wal_level=logical）==="
 pg_ctl_q stop -m fast >/dev/null 2>&1 || true
-rm -rf "$PGDATA" "$PGSOCK" "$SQLDIR"; mkdir -p "$PGSOCK"
+rm -rf "$PGDATA" "$PGSOCK" "$SQLDIR" "$SQLDIR2"; mkdir -p "$PGSOCK"
 initdb -D "$PGDATA" -U postgres --auth=trust -E UTF8 --no-sync >/dev/null
 cat >> "$PGDATA/postgresql.conf" <<EOF
 port = $PGPORT
@@ -225,6 +227,8 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/source/operatio
 check "$code" "422" "非法 sha256 被 pydantic 拒绝"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/directory?point=not-a-lsn")
 check "$code" "400" "非法 LSN 参数 400"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/directory")
+check "$code" "400" "point 与 seq 都不给时 400"
 
 # ------------------------------------------------------------- 5. 强杀应用后续接：无重复、无丢失、槽位不超前落盘
 echo "=== 5. 强杀重启一致性 ==="
@@ -259,19 +263,140 @@ check "$(api /api/history/1001 | jq '[.history[]|select(.version=="8.8.8")]|leng
 echo "=== 6. 源库重启后自动重连续接 ==="
 pg_ctl_q restart -w >/dev/null
 sleep 1
-for _ in $(seq 1 20); do
-  api /api/progress | jq -e '.phase=="STREAMING"' >/dev/null && break
+for _ in $(seq 1 30); do
+  [ "$(api /api/progress | jq -r .stream_connected)" = "true" ] && break
   sleep 1
 done
+check "$(api /api/progress | jq -r .stream_connected)" "true" "续接状态：复制流已重新连接"
 check "$(api /api/progress | jq -r .phase)" "STREAMING" "源库重启后应用自动恢复 STREAMING"
 curl -s -X POST "$BASE/api/source/operations" -H 'Content-Type: application/json' -d "{
  \"operations\":[{\"op\":\"update\",\"artifact_no\":1001,\"service_name\":\"billing-gateway\",\"version\":\"9.9.9\",\"sha256\":\"$SHA64\"}]}" >/dev/null
 sleep 2
 check "$(api /api/history/1001 | jq '[.history[]|select(.version=="9.9.9")]|length')" "1" "断连恢复后的变更未丢失"
 
-# ------------------------------------------------------------- 7. 持久化校验
-echo "=== 7. 两侧持久化 ==="
+# ------------------------------------------------------------- 7. 积压事务突发消费：提交点互不串扰（核心回归）
+echo "=== 7. 积压多笔事务：每笔独立提交点 ==="
+# 应用离线期间连发两笔版本修改，积压在复制槽里，重连后同批消费。
+# 旧版本会把两笔记成同一个提交点 LSN（wal_end），选第一笔却看到第二笔。
+stop_app
+psql -h "$PGSOCK" -p "$PGPORT" -U postgres -q -c \
+  "update artifacts set version='10.0.1', sha256='$SHA64' where artifact_no=1001"
+psql -h "$PGSOCK" -p "$PGPORT" -U postgres -q -c \
+  "update artifacts set version='10.0.2', sha256='$SHA64' where artifact_no=1001"
+start_app "$SQLDIR"
+wait_phase STREAMING 15 || bad "积压场景应用未就绪"
+for _ in $(seq 1 20); do
+  n=$(api /api/history/1001 | jq '[.history[]|select(.version=="10.0.2")]|length')
+  [ "$n" = "1" ] && break
+  sleep 1
+done
+check "$(api /api/history/1001 | jq '[.history[]|select(.version=="10.0.1")]|length')" "1" "积压事务 10.0.1 已捕获"
+check "$(api /api/history/1001 | jq '[.history[]|select(.version=="10.0.2")]|length')" "1" "积压事务 10.0.2 已捕获"
+mapfile -t pts < <(api /api/points | jq -r \
+  '[.points[]|select(.kind=="TXN" and .change_count>0)][-2:][]|"\(.seq) \(.lsn)"')
+s1=$(echo "${pts[0]}" | cut -d' ' -f1); l1=$(echo "${pts[0]}" | cut -d' ' -f2)
+s2=$(echo "${pts[1]}" | cut -d' ' -f1); l2=$(echo "${pts[1]}" | cut -d' ' -f2)
+if [ "$l1" != "$l2" ]; then
+  ok "积压两笔事务获得各自独立的提交点 LSN（$l1 / $l2）"
+else
+  bad "两笔积压事务共享提交点 LSN（旧 bug 复现）: $l1"
+fi
+check "$(api "/api/directory?seq=$s1" | jq -r '.artifacts[]|select(.artifact_no==1001)|.version')" \
+      "10.0.1" "选择第一笔提交点只看到第一笔版本"
+check "$(api "/api/directory?seq=$s2" | jq -r '.artifacts[]|select(.artifact_no==1001)|.version')" \
+      "10.0.2" "选择第二笔提交点看到第二笔版本"
+check "$(api "/api/directory?point=$l1" | jq -r '.artifacts[]|select(.artifact_no==1001)|.version')" \
+      "10.0.1" "无歧义旧链接按 LSN 回看第一笔"
+
+# ------------------------------------------------------------- 8. 落盘后确认前强杀：重连不重复、不遗漏
+echo "=== 8. 落盘后确认前强杀 ==="
+# 测试钩子 TEST_SKIP_FEEDBACK=1：事务落盘后故意不 send_feedback，
+# 确定性模拟“已落盘、未确认”时刻被强杀。
+TEST_SKIP_FEEDBACK=1 start_app "$SQLDIR"
+wait_phase STREAMING 15 || bad "钩子应用未就绪"
+before=$(api /api/progress | jq .captured_transactions)
+curl -s -X POST "$BASE/api/source/operations" -H 'Content-Type: application/json' -d "{
+ \"operations\":[{\"op\":\"update\",\"artifact_no\":1001,\"service_name\":\"billing-gateway\",\"version\":\"11.0.1\",\"sha256\":\"$SHA64\"}]}" >/dev/null
+for _ in $(seq 1 20); do
+  n=$(api /api/progress | jq .captured_transactions)
+  [ "$n" -gt "$before" ] && break
+  sleep 0.5
+done
+mid=$(api /api/progress | jq .captured_transactions)
+[ "$mid" -gt "$before" ] && ok "事务已落盘（确认前）" || bad "事务未落盘"
+grep -q "feedback skipped" /tmp/selftest-app.log \
+  && ok "钩子已跳过确认（模拟落盘后、确认前）" || bad "跳过确认钩子未生效"
+kill -9 "$(app_pid)" 2>/dev/null || true; sleep 2
+start_app "$SQLDIR"
+wait_phase STREAMING 15 || true
+sleep 3
+check "$(api /api/progress | jq .captured_transactions)" "$mid" "重连重放后事务数不重复"
+check "$(api /api/history/1001 | jq '[.history[]|select(.version=="11.0.1")]|length')" "1" "落盘未确认的事务不丢且只有一条"
+curl -s -X POST "$BASE/api/source/operations" -H 'Content-Type: application/json' -d "{
+ \"operations\":[{\"op\":\"update\",\"artifact_no\":1001,\"service_name\":\"billing-gateway\",\"version\":\"11.0.2\",\"sha256\":\"$SHA64\"}]}" >/dev/null
+sleep 2
+check "$(api /api/history/1001 | jq '[.history[]|select(.version=="11.0.2")]|length')" "1" "续接后后续事务未遗漏"
+flush=$(psql -h "$PGSOCK" -p "$PGPORT" -U postgres -tAc \
+  "select confirmed_flush_lsn from pg_replication_slots where slot_name='artifacts_history_slot'")
+last=$(api /api/progress | jq -r .last_commit_lsn)
+fnum=$(python3 -c "h,l='$flush'.split('/');print((int(h,16)<<32)+int(l,16))")
+lnum=$(python3 -c "h,l='$last'.split('/');print((int(h,16)<<32)+int(l,16))")
+[ "$fnum" -le "$lnum" ] && ok "强杀续接后槽位仍不超前落盘（$flush <= $last）" \
+                          || bad "槽位超前落盘位置: $flush > $last"
+
+# ------------------------------------------------------------- 9. 旧版 SQLite 卷原地升级
+echo "=== 9. 旧卷原地升级：历史保留、歧义提示、新旧混合 ==="
+rm -rf "$SQLDIR2"; mkdir -p "$SQLDIR2"
+python3 tests/make_legacy_db.py "$SQLDIR2/history.db" >/dev/null
+start_app "$SQLDIR2"
+wait_phase STREAMING 15 || bad "旧卷升级后未进入 STREAMING"
+check "$(api /api/progress | jq -r .schema_version)" "2" "旧卷已原地升级到 schema v2"
+check "$(api /api/progress | jq -r .phase)" "STREAMING" "旧卷升级后正常续接"
+check "$(api /api/history/7001 | jq -r '[.history[].version]|join(",")')" "L1,L2" "旧事务历史原样保留"
+# 两笔旧事务共享同一记录 LSN：旧链接必须提示歧义并给出候选
+code=$(curl -s -o /tmp/amb.json -w '%{http_code}' "$BASE/api/directory?point=0/60000000")
+check "$code" "409" "共享 LSN 的旧链接返回歧义提示（409）"
+check "$(jq '.detail.candidates|length' /tmp/amb.json)" "2" "歧义响应列出两笔候选事务"
+s1=$(jq -r '.detail.candidates[0].seq' /tmp/amb.json)
+s2=$(jq -r '.detail.candidates[1].seq' /tmp/amb.json)
+check "$(api "/api/directory?seq=$s1" | jq -r '.artifacts[]|select(.artifact_no==7001)|.version')" \
+      "L1" "逐笔选择：第一笔旧事务只见 L1"
+check "$(api "/api/directory?seq=$s2" | jq -r '.artifacts[]|select(.artifact_no==7001)|.version')" \
+      "L2" "逐笔选择：第二笔旧事务看到 L2"
+check "$(api "/api/directory?point=0/50000000" | jq '[.artifacts[]|select(.artifact_no==7000)]|length')" \
+      "1" "无歧义旧链接（基线）照常可用"
+check "$(api /api/points | jq -r '[.points[]|select(.xid==900001)][0].lsn_kind')" \
+      "recorded" "旧事务标记为记录值 LSN"
+check "$(api /api/points | jq -r '[.points[]|select(.xid==900001)][0].lsn')" \
+      "0/60000000" "旧事务保留原记录 LSN，未伪造真实源 LSN"
+# 新旧混合：新事务回看包含旧状态；旧点不包含新状态
+curl -s -X POST "$BASE/api/source/operations" -H 'Content-Type: application/json' -d "{
+ \"operations\":[{\"op\":\"update\",\"artifact_no\":1001,\"service_name\":\"billing-gateway\",\"version\":\"12.0.1\",\"sha256\":\"$SHA64\"}]}" >/dev/null
+sleep 2
+newseq=$(api /api/points | jq '[.points[]|select(.kind=="TXN")]|max_by(.seq).seq')
+check "$(api "/api/directory?seq=$newseq" | jq -r '.artifacts[]|select(.artifact_no==7001)|.version')" \
+      "L2" "新旧混合：新提交点回看包含旧事务状态"
+check "$(api "/api/directory?seq=$newseq" | jq -r '.artifacts[]|select(.artifact_no==1001)|.version')" \
+      "12.0.1" "新旧混合：新提交点包含新变更"
+check "$(api "/api/directory?seq=$s2" | jq '[.artifacts[]|select(.artifact_no==1001)]|length')" \
+      "0" "新旧混合：旧提交点不包含新变更（只含所选事务及此前状态）"
+check "$(api /api/points | jq '[.points[]|select(.kind=="TXN" and .lsn_kind=="commit")]|length' | awk '{print ($1>=1)?"yes":"no"}')" \
+      "yes" "新事务记录真实提交 LSN（lsn_kind=commit）"
+# 旧卷里的记录值可能超前于源端真实 WAL 末端，keepalive 应答必须钳制，
+# 不得把真实槽位推进到源端 WAL 末端之外
+sleep 6
+flush=$(psql -h "$PGSOCK" -p "$PGPORT" -U postgres -tAc \
+  "select confirmed_flush_lsn from pg_replication_slots where slot_name='artifacts_history_slot'")
+walnow=$(psql -h "$PGSOCK" -p "$PGPORT" -U postgres -tAc "select pg_current_wal_lsn()")
+fnum=$(python3 -c "h,l='$flush'.split('/');print((int(h,16)<<32)+int(l,16))")
+wnum=$(python3 -c "h,l='$walnow'.split('/');print((int(h,16)<<32)+int(l,16))")
+[ "$fnum" -le "$wnum" ] && ok "旧卷记录值未污染槽位：confirmed($flush) 不超源端 WAL 末端($walnow)" \
+                          || bad "槽位被旧卷记录值污染: $flush > $walnow"
+
+# ------------------------------------------------------------- 10. 持久化校验
+echo "=== 10. 两侧持久化 ==="
 [ -f "$SQLDIR/history.db" ] && ok "SQLite 历史库落盘: $SQLDIR/history.db" || bad "SQLite 未落盘"
+[ -f "$SQLDIR2/history.db" ] && ok "升级后的旧卷落盘: $SQLDIR2/history.db" || bad "旧卷 SQLite 未落盘"
 [ -d "$PGDATA/pg_wal" ] && ok "PostgreSQL 数据目录持久化: $PGDATA" || bad "PG 数据目录缺失"
 
 echo

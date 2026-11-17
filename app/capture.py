@@ -7,14 +7,21 @@
 2. 另开一条普通连接 SET TRANSACTION SNAPSHOT 复用该快照做整表基线；
 3. 从槽的 LSN 开始读逻辑变更流。快照时刻"正在进行中"的事务不会进基线，
    而它们提交后必然出现在复制流里——基线前开始、基线后提交的事务不会漏；
-4. 每个源事务先整体写 SQLite（数据 + 提交点同事务），成功后才通过
-   复制协议 send_feedback 推进源端槽位。任何时刻强杀：未落盘的事务槽位
-   不会前进，重启后重放并按 xid 幂等去重，已保存历史与续接位置永远一致。
+4. 提交点定位：COMMIT 消息的 data_start 是该事务提交记录的结束 LSN
+   （解码上下文 write_location = txn->end_lsn），每笔事务唯一、按提交
+   顺序单调递增，是唯一可靠的提交点标识。wal_end 按复制协议定义是
+   "服务器当前 WAL 末端"，不是事务标识，绝不能用它充当提交点；
+5. 每个源事务先整体写 SQLite（数据 + 提交点同事务），成功后才通过
+   复制协议 send_feedback(flush_lsn=该事务自己的提交 LSN) 推进源端槽位。
+   任何时刻强杀：未落盘的事务槽位不会前进，重启后重放并按 xid 幂等
+   去重；落盘后确认前断开，重连重放该事务、去重跳过、再确认——
+   不重复、不漏掉后续事务。
 """
 from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any
 
 import psycopg2
@@ -38,6 +45,9 @@ class CaptureWorker:
         self._thread: threading.Thread | None = None
         self._current_xid: int | None = None
         self._current_changes: list[dict[str, Any]] = []
+        # 最近一次已向源端确认的落盘位置（只可能落后、绝不超前）
+        self._last_confirmed_lsn: int = 0
+        self._last_feedback_at: float = 0.0
 
     # ----------------------------------------------------------------- life
     def start(self) -> None:
@@ -65,6 +75,13 @@ class CaptureWorker:
     def _run(self) -> None:
         self._source.ensure_schema()
         state = self._store.get_state()
+        # 已确认位置从本地落盘状态恢复：重启后 keepalive 应答不会
+        # 把槽位推进到任何未落盘的位置之后。
+        persisted = state.get("last_commit_lsn_num") or state.get(
+            "baseline_lsn_num"
+        )
+        if persisted:
+            self._last_confirmed_lsn = int(persisted)
         if state.get("baseline_lsn"):
             log.info("resuming capture from slot %s", self._settings.slot_name)
         else:
@@ -176,11 +193,10 @@ class CaptureWorker:
                 )
                 log.info("replication stream started on slot %s", slot)
                 transient_streak = 0
-                # 重连成功即恢复正常服务状态，并清空历史断线提示
+                # 重连成功即恢复正常服务状态，并记录续接状态
                 if self._store.get_phase() != PHASE_STREAMING:
                     self._store.mark_streaming()
-                else:
-                    self._store.clear_error()
+                self._store.mark_stream_connected()
                 cur.consume_stream(
                     lambda msg: self._handle_message(msg),
                     keepalive_interval=self._settings.status_interval_s,
@@ -195,6 +211,9 @@ class CaptureWorker:
                 )
                 # 应用刚重启时旧 walsender 释放槽位有短暂延迟，属可恢复瞬断：
                 # 保留 STREAMING，历史查询继续可用；连续失败才降级为 ERROR。
+                self._store.mark_stream_disconnected(
+                    f"replication stream broken: {exc}"
+                )
                 if transient_streak >= 3:
                     self._store.mark_error(
                         f"replication stream broken: {exc}"
@@ -211,8 +230,11 @@ class CaptureWorker:
         if self._stop.is_set():
             raise psycopg2.OperationalError("shutting down")
 
-        if msg.data_start == 0:  # Primary keepalive 消息无载荷
-            # 不主动确认：只随已落盘事务推进，绝不确认尚未落盘的更改
+        if not msg.payload:  # Primary keepalive：无载荷
+            # 只回送"已落盘且已确认"的位置，绝不确认尚未落盘的更改；
+            # 同时满足 wal_sender_timeout 对客户端应答的要求，避免
+            # 空闲时段被源端误判超时断开。
+            self._maybe_reply_keepalive(msg)
             return
 
         data = msg.payload.decode("utf-8")
@@ -230,11 +252,31 @@ class CaptureWorker:
         elif kind == "CHANGE":
             self._current_changes.append(parsed)
         elif kind == "COMMIT":
-            # test_decoding: COMMIT 行本身不带 LSN，消息 wal_end 即该事务
-            # 提交记录结束位置，用作该提交点的 LSN。
-            commit_lsn = msg.wal_end
-            self._finish_transaction(parsed["xid"], commit_lsn, data, msg)
+            # data_start 是该 COMMIT 消息在 WAL 中的位置，即该事务提交
+            # 记录的结束 LSN：每笔事务唯一、按提交顺序单调递增。
+            # 提交点必须取这个值，而不是协议里表示"服务器 WAL 末端"的
+            # wal_end——后者不是事务标识。
+            self._finish_transaction(parsed["xid"], msg.data_start, data, msg)
         self._store.update_last_message_lsn(str(msg.wal_end))
+
+    def _maybe_reply_keepalive(self, msg: Any) -> None:
+        if not self._last_confirmed_lsn:
+            return
+        now = time.monotonic()
+        if now - self._last_feedback_at < self._settings.status_interval_s:
+            return
+        # 钳制到源端当前 WAL 末端：旧卷的本地记录值可能超前于源端
+        # （例如旧版记录的不是真实提交 LSN），确认位置绝不越过源端实际末端。
+        flush = self._last_confirmed_lsn
+        if msg.wal_end and flush > msg.wal_end:
+            flush = msg.wal_end
+        if not flush:
+            return
+        try:
+            msg.cursor.send_feedback(flush_lsn=flush)
+            self._last_feedback_at = now
+        except Exception as exc:  # 应答失败不影响主流程，下一轮再试
+            log.debug("keepalive feedback failed: %r", exc)
 
     def _finish_transaction(self, xid: int, commit_lsn: int,
                             raw_commit_msg: str, msg: Any) -> None:
@@ -257,8 +299,19 @@ class CaptureWorker:
         else:
             log.info("txn %s replayed after restart, skipped (idempotent)", xid)
 
-        # 数据已落盘（或此前已落盘）——现在才通过复制协议向源端确认，
-        # 推进该槽的 confirmed_flush_lsn。绝不在落盘前发送 feedback。
-        msg.cursor.send_feedback(flush_lsn=commit_lsn)
+        if self._settings.test_skip_feedback:
+            # 测试钩子：落盘后故意不确认，模拟"落盘后确认前断开/强杀"。
+            log.warning(
+                "TEST hook: persist done, feedback skipped for xid=%s at %s",
+                xid, lsn_text,
+            )
+        else:
+            # 数据已落盘（或此前已落盘）——现在才通过复制协议向源端确认，
+            # 推进该槽的 confirmed_flush_lsn。flush_lsn 用该事务自己的
+            # 提交 LSN，绝不超前任何尚未落盘的事务。
+            msg.cursor.send_feedback(flush_lsn=commit_lsn, force=True)
+            self._last_confirmed_lsn = commit_lsn
+            self._last_feedback_at = time.monotonic()
+            self._store.record_confirmed(lsn_text, commit_lsn)
         self._current_changes = []
         self._current_xid = None

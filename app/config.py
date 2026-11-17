@@ -26,6 +26,9 @@ class Settings:
     # 直到基线落盘后才提交：确定性地构造"基线前开始、基线后提交"的事务。
     inflight_hook_no: int = int(_env("TEST_INFLIGHT_ARTIFACT_NO", "0"))
     inflight_hook_sleep_s: float = float(_env("TEST_INFLIGHT_SLEEP_S", "3"))
+    # 设置后，事务落盘后故意不 send_feedback：确定性模拟
+    # "落盘后、确认前断开/强杀"的场景，验证重连不重复、不遗漏。
+    test_skip_feedback: bool = _env("TEST_SKIP_FEEDBACK", "") == "1"
 
     # ---- 本地历史库 SQLite ----
     sqlite_path: str = _env("SQLITE_PATH", "/tmp/capture/history.db")

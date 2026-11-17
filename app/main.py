@@ -145,25 +145,74 @@ def api_points() -> dict:
 
 
 @app.get("/api/directory")
-def api_directory(point: str) -> JSONResponse:
-    """按提交点（LSN，如 0/16B3748）查看该时刻的整张目录。"""
+def api_directory(
+    point: str | None = None, seq: int | None = None
+) -> JSONResponse:
+    """回看某个提交点的整张目录（只含所选事务及此前状态）。
+
+    两种定位方式，必须且只能给一种：
+    - seq=<提交点序号>：精确定位，每笔事务独立回看（新链接推荐）；
+    - point=<LSN>：兼容旧链接。该 LSN 只对应一笔提交点时直接回看；
+      对应多笔事务（旧版本曾把积压事务记成同一 LSN）时返回 409 与
+      候选列表，由调用方按 seq 逐笔选择。旧事务的 LSN 是当时的
+      记录值，不伪造真实源 LSN。
+    """
     _require_ready()
-    try:
-        lsn_num = lsn_to_num(point)
-    except (ValueError, IndexError):
-        raise HTTPException(status_code=400, detail="point 必须是 LSN，形如 0/16B3748")
-    points = store.get_points()
-    valid_nums = {p["lsn_num"] for p in points}
-    if lsn_num not in valid_nums:
+    if (point is None) == (seq is None):
         raise HTTPException(
-            status_code=404,
-            detail="该 LSN 不是已捕获的提交点，请先在 /api/points 中选择",
+            status_code=400,
+            detail="point 与 seq 必须且只能提供一个",
         )
+    if seq is not None:
+        selected = store.get_point_by_seq(seq)
+        if selected is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"序号 {seq} 不是已捕获的提交点，请先在 /api/points 中选择",
+            )
+    else:
+        try:
+            lsn_num = lsn_to_num(point)
+        except (ValueError, IndexError, AttributeError):
+            raise HTTPException(
+                status_code=400, detail="point 必须是 LSN，形如 0/16B3748"
+            )
+        candidates = store.get_points_by_lsn_num(lsn_num)
+        if not candidates:
+            raise HTTPException(
+                status_code=404,
+                detail="该 LSN 不是已捕获的提交点，请先在 /api/points 中选择",
+            )
+        if len(candidates) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "该 LSN 对应多笔事务（旧版本把同批积压事务记成了同一"
+                        "提交点），无法唯一确定，请按序号逐笔选择"
+                    ),
+                    "candidates": [
+                        {
+                            "seq": c["seq"],
+                            "kind": c["kind"],
+                            "xid": c["xid"],
+                            "commit_ts": c["commit_ts"],
+                            "change_count": c["change_count"],
+                            "lsn_kind": c["lsn_kind"],
+                        }
+                        for c in candidates
+                    ],
+                    "hint": "使用 /api/directory?seq=<序号> 查看对应事务的目录",
+                },
+            )
+        selected = candidates[0]
     return JSONResponse(
         {
-            "point": point,
-            "point_lsn_num": lsn_num,
-            "artifacts": store.get_directory_at(lsn_num),
+            "point": selected["lsn"],
+            "point_lsn_num": selected["lsn_num"],
+            "seq": selected["seq"],
+            "point_info": selected,
+            "artifacts": store.get_directory_at(selected["seq"]),
         }
     )
 
